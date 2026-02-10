@@ -1,11 +1,8 @@
 import axios from 'axios';
 import { Platform } from 'react-native';
 
-// Use your machine's local IP for physical devices (Expo Go)
-const DEV_MACHINE_IP = '172.16.0.233';
-const BASE_URL = Platform.OS === 'android'
-    ? `http://${DEV_MACHINE_IP}:3000/api/markets`
-    : `http://${DEV_MACHINE_IP}:3000/api/markets`;
+// Production Vercel URL
+const BASE_URL = 'https://world-percent.vercel.app/api/markets';
 
 export interface Market {
     id: string;
