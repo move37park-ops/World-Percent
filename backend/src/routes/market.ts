@@ -1,35 +1,40 @@
 import express from 'express';
-import { fetchTopMarkets, fetchMarketsByCategory, Market } from '../services/polymarket';
-import { translateToKorean } from '../services/translator';
+import { getDB } from '../config/db';
 
 export const marketRouter = express.Router();
 
 marketRouter.get('/', async (req, res) => {
     try {
-        const category = (req.query.category as string) || 'macro'; // Default to macro
-        console.log(`Fetching markets for category: ${category}`);
+        const db = await getDB();
+        const category = req.query.category;
+        
+        let rows;
+        if (category) {
+            rows = await db.all('SELECT * FROM markets WHERE category = ? ORDER BY volume DESC', [category]);
+        } else {
+            rows = await db.all('SELECT * FROM markets ORDER BY volume DESC');
+        }
+        
+        // Parse the JSON string outcomes back into objects for the frontend
+        const formattedMarkets = rows.map((row: any) => {
+            let parsedOutcomes = [];
+            let parsedTranslatedOutcomes = [];
+            
+            try { if (row.outcomes) parsedOutcomes = JSON.parse(row.outcomes); } catch(e){}
+            try { if (row.translated_outcomes) parsedTranslatedOutcomes = JSON.parse(row.translated_outcomes); } catch(e){}
 
-        const rawMarkets = await fetchMarketsByCategory(category);
+            return {
+                id: row.polymarket_id,
+                originalTitle: row.original_title,
+                title: row.translated_title,
+                volume: row.volume,
+                endDate: row.end_date,
+                category: row.category,
+                markets: parsedTranslatedOutcomes.length > 0 ? parsedTranslatedOutcomes : parsedOutcomes
+            };
+        });
 
-        // Translate titles in parallel
-        const translatedMarkets = await Promise.all(
-            rawMarkets.map(async (market) => {
-                // If we already have a custom title (indicated by presence of originalTitle), skip translation
-                let translatedTitle = market.title;
-
-                if (!(market as any).originalTitle) {
-                    translatedTitle = await translateToKorean(market.title);
-                }
-
-                return {
-                    ...market,
-                    title: translatedTitle,
-                    originalTitle: (market as any).originalTitle || market.title,
-                };
-            })
-        );
-
-        res.json(translatedMarkets);
+        res.json(formattedMarkets);
     } catch (error) {
         console.error('Error in market route:', error);
         res.status(500).json({ error: 'Failed to fetch markets' });

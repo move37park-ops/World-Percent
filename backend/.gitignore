@@ -1,0 +1,8 @@
+node_modules/
+.env
+database.sqlite
+out.log
+out_v2.log
+expo_out.log
+test_standalone_worker.ts
+dist/
