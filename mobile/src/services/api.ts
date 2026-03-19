@@ -1,14 +1,14 @@
 import axios from 'axios';
 import { Platform } from 'react-native';
 
-// Production Vercel URL
-const BASE_URL = 'https://world-percent.vercel.app/api/markets';
+const BASE_URL = 'http://172.16.51.98:3000/api/markets';
 
 export interface Market {
     id: string;
     title: string;
     originalTitle?: string;
     volume: number;
+    category?: string;
     markets: {
         id: string;
         question: string;

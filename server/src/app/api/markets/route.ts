@@ -1,37 +1,25 @@
 import { NextResponse } from 'next/server';
-import { fetchMarketsByCategory, Market } from '../../../lib/polymarket';
-import { translateToKorean } from '../../../lib/translator';
 
 export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const category = searchParams.get('category')?.toLowerCase() || 'macro';
 
-    console.log(`[API] Received request for category: ${category}`);
+    console.log(`[Next.js API] Proxying request for category: ${category} to local backend`);
 
     try {
-        const rawMarkets = await fetchMarketsByCategory(category);
-
-        // Translate titles in parallel
-        const translatedMarkets = await Promise.all(
-            rawMarkets.map(async (market) => {
-                // If we already have a custom title (indicated by presence of originalTitle), skip translation
-                let translatedTitle = market.title;
-
-                if (!(market as any).originalTitle) {
-                    translatedTitle = await translateToKorean(market.title);
-                }
-
-                return {
-                    ...market,
-                    title: translatedTitle,
-                    originalTitle: (market as any).originalTitle || market.title,
-                };
-            })
-        );
-
-        return NextResponse.json(translatedMarkets);
+        // Fetch from the refactored automated backend
+        const response = await fetch(`http://localhost:3000/api/markets?category=${category}`, {
+            cache: 'no-store'
+        });
+        
+        if (!response.ok) {
+            throw new Error(`Backend response was not ok: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        return NextResponse.json(data);
     } catch (error) {
-        console.error('Error in market API route:', error);
-        return NextResponse.json({ error: 'Failed to fetch markets' }, { status: 500 });
+        console.error('Error in market API proxy:', error);
+        return NextResponse.json({ error: 'Failed to fetch markets from backend' }, { status: 500 });
     }
 }
