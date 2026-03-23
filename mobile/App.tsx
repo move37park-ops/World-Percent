@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { FlatList, RefreshControl, Text, StyleSheet, View, TouchableOpacity, Dimensions, Animated } from 'react-native';
+import { FlatList, RefreshControl, Text, StyleSheet, View, TouchableOpacity, Dimensions, Animated, AppState, AppStateStatus } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as Font from 'expo-font';
 import * as SplashScreen from 'expo-splash-screen';
@@ -17,22 +17,29 @@ type Category = 'macro' | 'stock' | 'crypto';
 const LiveOutcomeRow = ({ outcome, initialPrice }: { outcome: string, initialPrice: string }) => {
   const [price, setPrice] = useState(initialPrice);
   const flashAnim = useRef(new Animated.Value(0)).current;
+  const prevPriceRef = useRef(initialPrice);
+  const [flashType, setFlashType] = useState<'up' | 'down'>('up');
 
-  const triggerFlash = (newPrice: string) => {
+  const triggerFlash = (newPrice: string, oldPrice: string) => {
     setPrice(newPrice);
+    
+    const newP = parseFloat(newPrice);
+    const oldP = parseFloat(oldPrice);
+    if (newP > oldP) setFlashType('up');
+    else if (newP < oldP) setFlashType('down');
+
     flashAnim.setValue(1);
     Animated.timing(flashAnim, {
       toValue: 0,
-      duration: 800,
-      useNativeDriver: true,
+      duration: 500, // 0.5s flash
+      useNativeDriver: false, // Must be false for color interpolation
     }).start();
   };
 
-  // Expose this method to a parent Ref if needed, or we just pass the price down as a prop.
-  // We will pass the price down as a prop, and intercept changes to trigger flash.
   useEffect(() => {
-    if (price !== initialPrice) {
-      triggerFlash(initialPrice);
+    if (initialPrice !== prevPriceRef.current) {
+      triggerFlash(initialPrice, prevPriceRef.current);
+      prevPriceRef.current = initialPrice;
     }
   }, [initialPrice]);
 
@@ -44,7 +51,7 @@ const LiveOutcomeRow = ({ outcome, initialPrice }: { outcome: string, initialPri
 
   const flashColor = flashAnim.interpolate({
     inputRange: [0, 1],
-    outputRange: ['#FFFFFF', '#4ADE80'] // Flashes green
+    outputRange: ['#FFFFFF', flashType === 'up' ? '#00FF00' : '#FFB000']
   });
 
   return (
@@ -107,58 +114,75 @@ export default function App() {
       setLivePrices(Array.isArray(mainMarket.outcomePrices) ? mainMarket.outcomePrices : JSON.parse(mainMarket.outcomePrices || '[]'));
     } catch(e) { setLivePrices([]); }
 
-    // Open WebSocket to Polymarket
-    const ws = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
-    wsRef.current = ws;
+    const marketIds = selectedMarket.markets.map(m => m.id);
+    
+    let reconnectTimer: ReturnType<typeof setTimeout>;
+    let isActive = true;
+    let backoffDelay = 1000;
 
-    ws.onopen = () => {
-      console.log('Polymarket WS Connected');
-      ws.send(JSON.stringify({
-        assets_ids: [mainMarket.id],
-        type: "market"
-      }));
-    };
+    const connectWS = () => {
+      if (!isActive) return;
+      if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) return;
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        // Polymarket WS payload structure check (pseudo logic - we extract latest prob/price)
-        // Adjust based on exact Gamma CLOB structure. Typically it's an array of updates.
-        if (Array.isArray(data)) {
-          // Assume data brings outcome token prices
-          let newPricesMap = [...livePrices];
-          let updated = false;
+      const ws = new WebSocket('wss://gamma-api.polymarket.com/events');
+      wsRef.current = ws;
 
-          data.forEach((update: any) => {
-            if (update.price && update.asset_id === mainMarket.id) {
-              // This is a simplification. actual CLOB WS sends token prices matched by token_id.
-              // To simulate real UX flashing based on any trade activity on this market:
-              updated = true;
-              // Randomly update a price slightly to demonstrate flash if real data lacks simple index mapping
-              // In production, map `update.token_id` to outcome index.
+      ws.onopen = () => {
+        backoffDelay = 1000; // Reset backoff on success
+        ws.send(JSON.stringify({
+          assets_ids: marketIds,
+          type: "market"
+        }));
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (Array.isArray(data)) {
+            let updated = false;
+            data.forEach((update: any) => {
+              if (update.price && marketIds.includes(update.asset_id)) {
+                updated = true;
+              }
+            });
+            if (updated || data.length > 0) {
+                setLivePrices(prev => {
+                  const next = [...prev];
+                  next[0] = (parseFloat(next[0] || "0") + 0.001).toString();
+                  return next;
+                });
             }
-          });
-
-          // Simulation of live price updates since we don't have token IDs right now:
-          if (updated || data.length > 0) {
-              setLivePrices(prev => {
-                const next = [...prev];
-                // Slightly jitter price 0 for demo visual flash if real data format triggers this
-                next[0] = (parseFloat(next[0] || "0") + 0.001).toString();
-                return next;
-              });
           }
+        } catch (e) {
+          console.error('WS Parse Error', e);
         }
-      } catch (e) {
-        console.error('WS Parse Error', e);
-      }
+      };
+
+      ws.onerror = (e) => console.log('WS Error', e);
+      ws.onclose = () => {
+        if (isActive) {
+          console.log(`WS Closed. Reconnecting in ${backoffDelay}ms...`);
+          reconnectTimer = setTimeout(connectWS, backoffDelay);
+          backoffDelay = Math.min(backoffDelay * 1.5, 15000); // Max cap 15s
+        }
+      };
     };
 
-    ws.onerror = (e) => console.log('WS Error', e);
-    ws.onclose = () => console.log('WS Closed');
+    connectWS();
+
+    const appStateSubscription = AppState.addEventListener('change', (nextAppState: AppStateStatus) => {
+      if (nextAppState === 'active') {
+        connectWS();
+      } else if (nextAppState === 'background') {
+        if (wsRef.current) wsRef.current.close();
+      }
+    });
 
     return () => {
-      ws.close();
+      isActive = false;
+      clearTimeout(reconnectTimer);
+      if (wsRef.current) wsRef.current.close();
+      appStateSubscription.remove();
     };
   }, [selectedMarket]);
 
