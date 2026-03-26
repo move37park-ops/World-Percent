@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import axios from 'axios';
 import { supabase } from '../../../utils/supabase';
-import { translateToKorean, translateBatchToKorean } from '../../../services/translator';
+import { translateBatchToKorean } from '../../../services/translator';
 
 const POLYMARKET_API_URL = 'https://gamma-api.polymarket.com/events';
 const VOLUME_THRESHOLD = 100000;
@@ -15,6 +15,15 @@ export async function GET(request: Request) {
     }
 
     try {
+        // 0. CLEANUP: Remove expired markets from DB before fetching new data
+        const now = new Date().toISOString();
+        const { error: cleanupErr } = await supabase
+            .from('markets')
+            .delete()
+            .lt('end_date', now);
+        if (cleanupErr) console.warn('[Cron Worker] Cleanup warning:', cleanupErr.message);
+        else console.log('[Cron Worker] Expired markets cleaned up.');
+
         console.log('[Cron Worker] Starting Polymarket data fetch...');
         const response = await axios.get(POLYMARKET_API_URL, {
             params: { limit: 100, active: true, closed: false, order: 'volume', ascending: false }
@@ -66,150 +75,125 @@ export async function GET(request: Request) {
 
         const existingMap = new Map((existingMarkets || []).map((m: any) => [m.polymarket_id, m]));
         
+        const allTextsToTranslate = new Set<string>();
+        const processedEvents: any[] = [];
+        let newCountForLimits = 0;
+
+        for (const event of targetEvents) {
+            // === STEP A: Select Top 10 Sub-Markets by Yes Probability ===
+            const parsedMarkets = event.markets.map((m: any) => {
+                let obs = m.outcomes;
+                if (typeof obs === 'string') { try { obs = JSON.parse(obs); } catch(e){} }
+                let prices = m.outcomePrices;
+                if (typeof prices === 'string') { try { prices = JSON.parse(prices); } catch(e){} }
+                
+                // "Yes probability" = first price for binary markets
+                const yesProb = Array.isArray(prices) ? parseFloat(prices[0] || '0') : 0;
+                
+                // For multi-choice markets (outcomes > 2), slice outcomes to top 10 by price
+                if (Array.isArray(obs) && Array.isArray(prices) && obs.length > 10 && obs.length === prices.length) {
+                    const combined = obs.map((o: string, i: number) => ({ o, p: prices[i] }));
+                    combined.sort((a: any, b: any) => parseFloat(b.p || '0') - parseFloat(a.p || '0'));
+                    const top = combined.slice(0, 10);
+                    obs = top.map((x: any) => x.o);
+                    prices = top.map((x: any) => x.p);
+                }
+                
+                return {
+                    id: m.id,
+                    question: m.question || '',
+                    outcomes: Array.isArray(obs) ? obs : [],
+                    outcomePrices: Array.isArray(prices) ? prices : [],
+                    _yesProb: yesProb
+                };
+            });
+
+            // Filter out resolved or empty submarkets before selecting top 10
+            const activeMarkets = parsedMarkets.filter((m: any) => {
+                if (!m.outcomePrices || m.outcomePrices.length === 0) return false;
+                // A submarket with any price at exactly 0 or 1 (±0.001 tolerance) is considered resolved
+                const allPrices = m.outcomePrices.map((p: string) => parseFloat(p));
+                const isResolved = allPrices.some((p: number) => p >= 0.999 || p <= 0.001);
+                return !isResolved;
+            });
+
+            // Sort by Yes probability descending, take top 10 sub-markets
+            activeMarkets.sort((a: any, b: any) => b._yesProb - a._yesProb);
+            const outcomesList = activeMarkets.slice(0, 10).map(({ _yesProb, ...rest }: any) => rest);
+
+            if (outcomesList.length === 0) continue; // Skip events with no active submarkets
+
+            // === STEP B: Collect texts that need translation ===
+            const existing = existingMap.get(String(event.id));
+
+            if (existing) {
+                // UPDATE path: only translate outcomes + questions
+                outcomesList.forEach((m: any) => {
+                    if (m.question) allTextsToTranslate.add(m.question);
+                    if (Array.isArray(m.outcomes)) {
+                        m.outcomes.forEach((o: string) => { if (o) allTextsToTranslate.add(o); });
+                    }
+                });
+                processedEvents.push({ type: 'update', event, outcomesList });
+            } else {
+                // INSERT path: translate title + outcomes + questions
+                if (newCountForLimits >= 10) {
+                    console.log(`[Cron Worker] Vercel Timeout protection: Skipping extra markets.`);
+                    continue;
+                }
+                newCountForLimits++;
+                
+                if (event.title) allTextsToTranslate.add(event.title);
+                outcomesList.forEach((m: any) => {
+                    if (m.question) allTextsToTranslate.add(m.question);
+                    if (Array.isArray(m.outcomes)) {
+                        m.outcomes.forEach((o: string) => { if (o) allTextsToTranslate.add(o); });
+                    }
+                });
+                processedEvents.push({ type: 'insert', event, outcomesList });
+            }
+        }
+
+        const translateArray = Array.from(allTextsToTranslate);
+        let translatedArray: string[] = [];
+        try {
+            translatedArray = await translateBatchToKorean(translateArray);
+        } catch(e) { console.error('Batch translation failed', e); }
+        
+        const translateMap = new Map<string, string>();
+        translateArray.forEach((t, i) => translateMap.set(t, translatedArray[i] || t));
+
+        const getTranslated = (t: string) => translateMap.get(t) || t;
+
+        // Helper: apply translations to an outcomesList
+        const translateOutcomesList = (list: any[]) => {
+            return list.map((m: any) => ({
+                ...m,
+                question: m.question ? getTranslated(m.question) : m.question,
+                outcomes: Array.isArray(m.outcomes) ? m.outcomes.map((o: string) => getTranslated(o)) : m.outcomes
+            }));
+        };
+
         const upsertBatch: any[] = [];
         let newCount = 0;
         let updateCount = 0;
 
-        for (const event of targetEvents) {
-            const outcomesList = event.markets.map((m: any) => ({
-                id: m.id,
-                question: m.question,
-                outcomes: m.outcomes, 
-                outcomePrices: m.outcomePrices 
-            }));
-
-            const existing = existingMap.get(String(event.id));
-
-            if (existing) {
-                // Formatting for Update
-                let updatedTranslatedOutcomes = existing.translated_outcomes;
-                try {
-                    const parsedTranslated = typeof existing.translated_outcomes === 'string' 
-                        ? JSON.parse(existing.translated_outcomes) 
-                        : existing.translated_outcomes;
-                    
-                    const newTranslated = outcomesList.map((newMarket: any) => {
-                        const oldMarket = (Array.isArray(parsedTranslated) ? parsedTranslated : []).find((pt: any) => pt.id === newMarket.id);
-                        if (oldMarket) {
-                            let oldObs = oldMarket.outcomes;
-                            let newObs = newMarket.outcomes;
-                            if (typeof oldObs === 'string') try { oldObs = JSON.parse(oldObs); } catch(e){}
-                            if (typeof newObs === 'string') try { newObs = JSON.parse(newObs); } catch(e){}
-                            
-                            // Keep old translation only if length perfectly matches
-                            if (Array.isArray(oldObs) && Array.isArray(newObs) && oldObs.length === newObs.length) {
-                                return { ...newMarket, question: oldMarket.question, outcomes: oldObs, outcomePrices: newMarket.outcomePrices };
-                            }
-                        }
-                        return { ...newMarket, _needsTranslation: true };
-                    });
-
-                    for (let i = 0; i < newTranslated.length; i++) {
-                        if (newTranslated[i]._needsTranslation) {
-                            console.log(`[Cron Worker] Dynamic Outcome detected. Translating new sub-market: ${newTranslated[i].question}`);
-                            const tQuestion = await translateToKorean(newTranslated[i].question);
-                            let obs = newTranslated[i].outcomes;
-                            if (typeof obs === 'string') try { obs = JSON.parse(obs); } catch(e){}
-                            if (Array.isArray(obs)) {
-                                const seq = [];
-                                for (const o of obs) {
-                                    const lowerO = (o || '').toLowerCase();
-                                    if (!o) seq.push('');
-                                    else if (lowerO === 'yes') seq.push('예');
-                                    else if (lowerO === 'no') seq.push('아니오');
-                                    else seq.push(await translateToKorean(o));
-                                }
-                                obs = seq;
-                            }
-                            newTranslated[i].question = tQuestion;
-                            newTranslated[i].outcomes = obs;
-                            delete newTranslated[i]._needsTranslation;
-                        }
-                    }
-
-                    updatedTranslatedOutcomes = newTranslated;
-                } catch (e) { console.error('Error updating prices:', e); }
-
+        for (const proc of processedEvents) {
+            const { type, event, outcomesList } = proc;
+            const translatedOutcomes = translateOutcomesList(outcomesList);
+            
+            if (type === 'update') {
                 upsertBatch.push({
                     polymarket_id: String(event.id),
-                    // Missing required titles will be ignored by pure update, but doing a full upsert 
-                    // requires all required fields. Supabase .upsert() replaces whole row if we don't supply everything unless we do .update().
-                    // Since it's N+1, we'll do an upsert but we need the titles. Wait, we don't have titles in select!
-                    // Let's just collect updates and inserts separately, or fetch everything required.
                     volume: parseFloat(event.volume || '0'),
                     end_date: event.endDate || null,
                     outcomes: outcomesList,
-                    translated_outcomes: updatedTranslatedOutcomes,
+                    translated_outcomes: translatedOutcomes,
                     updated_at: new Date().toISOString()
                 });
                 updateCount++;
             } else {
-                // Translation Limiter
-                if (newCount >= 10) {
-                    console.log(`[Cron Worker] Vercel Timeout protection: Skipping extra markets.`);
-                    continue; 
-                }
-
-                console.log(`[Cron Worker] Translating Market: ${event.title}`);
-                
-                const textsToTranslate: string[] = [];
-                const pointerMap: { type: 'title' | 'question' | 'outcome', original: string, mappedIndex: number, staticFallback?: string, refIndex?: number }[] = [];
-                
-                pointerMap.push({ type: 'title', original: event.title, mappedIndex: textsToTranslate.length });
-                textsToTranslate.push(event.title);
-                
-                outcomesList.forEach((m: any, mIdx: number) => {
-                    if (m.question) {
-                        pointerMap.push({ type: 'question', original: m.question, mappedIndex: textsToTranslate.length, refIndex: mIdx });
-                        textsToTranslate.push(m.question);
-                    }
-                    
-                    let obs = m.outcomes;
-                    if (typeof obs === 'string') { try { obs = JSON.parse(obs); } catch(e){} }
-                    if (Array.isArray(obs)) {
-                        obs.forEach((o, oIdx) => {
-                            const lowerO = (o || '').toLowerCase();
-                            if (!o) {
-                                pointerMap.push({ type: 'outcome', original: o, mappedIndex: -1, staticFallback: '', refIndex: mIdx });
-                            } else if (lowerO === 'yes') {
-                                pointerMap.push({ type: 'outcome', original: o, mappedIndex: -1, staticFallback: '예', refIndex: mIdx });
-                            } else if (lowerO === 'no') {
-                                pointerMap.push({ type: 'outcome', original: o, mappedIndex: -1, staticFallback: '아니오', refIndex: mIdx });
-                            } else {
-                                pointerMap.push({ type: 'outcome', original: o, mappedIndex: textsToTranslate.length, refIndex: mIdx });
-                                textsToTranslate.push(o);
-                            }
-                        });
-                    }
-                });
-
-                let translatedTexts: string[];
-                try {
-                    translatedTexts = await translateBatchToKorean(textsToTranslate);
-                } catch (e) {
-                    console.error(`[Cron Worker] Skipping market ${event.id} due to translation failure:`, e);
-                    continue; // Skip inserting this market to prevent poisoning the DB with english text
-                }
-                
-                let translatedTitle = event.title;
-                const finalOutcomesList = JSON.parse(JSON.stringify(outcomesList)); // deep clone
-                const outcomeCounters: { [key: number]: number } = {};
-
-                pointerMap.forEach(ptr => {
-                    const tStr = ptr.mappedIndex >= 0 ? translatedTexts[ptr.mappedIndex] : ptr.staticFallback;
-                    if (ptr.type === 'title') { translatedTitle = tStr || event.title; }
-                    else if (ptr.type === 'question' && ptr.refIndex !== undefined) { finalOutcomesList[ptr.refIndex].question = tStr || ptr.original; }
-                    else if (ptr.type === 'outcome' && ptr.refIndex !== undefined) {
-                        if (outcomeCounters[ptr.refIndex] === undefined) outcomeCounters[ptr.refIndex] = 0;
-                        const idx = outcomeCounters[ptr.refIndex]++;
-                        let currentOutcomes = finalOutcomesList[ptr.refIndex].outcomes;
-                        if (typeof currentOutcomes === 'string') { try { currentOutcomes = JSON.parse(currentOutcomes); } catch(e){} }
-                        if (Array.isArray(currentOutcomes)) {
-                            currentOutcomes[idx] = tStr || ptr.original;
-                            finalOutcomesList[ptr.refIndex].outcomes = currentOutcomes;
-                        }
-                    }
-                });
+                const translatedTitle = getTranslated(event.title);
                 
                 let category = 'macro';
                 if (event.tags && Array.isArray(event.tags)) {
@@ -229,8 +213,8 @@ export async function GET(request: Request) {
                     category: category,
                     volume: parseFloat(event.volume || '0'),
                     end_date: event.endDate || null,
-                    outcomes: finalOutcomesList,
-                    translated_outcomes: finalOutcomesList
+                    outcomes: outcomesList,
+                    translated_outcomes: translatedOutcomes
                 });
                 newCount++;
             }

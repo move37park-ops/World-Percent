@@ -1,10 +1,9 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { FlatList, RefreshControl, Text, StyleSheet, View, TouchableOpacity, Dimensions, Animated, AppState, AppStateStatus } from 'react-native';
+import { FlatList, ScrollView, RefreshControl, Text, StyleSheet, View, TouchableOpacity, Dimensions, Animated, AppState, AppStateStatus } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as Font from 'expo-font';
 import * as SplashScreen from 'expo-splash-screen';
 import { MainLayout } from './src/components/MainLayout';
-import { MarketItem } from './src/components/MarketItem';
 import { fetchMarkets, Market } from './src/services/api';
 
 SplashScreen.preventAutoHideAsync();
@@ -13,57 +12,6 @@ const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 type Category = 'macro' | 'stock' | 'crypto';
 
-// A separate component to handle real-time price updates and flash animations
-const LiveOutcomeRow = ({ outcome, initialPrice }: { outcome: string, initialPrice: string }) => {
-  const [price, setPrice] = useState(initialPrice);
-  const flashAnim = useRef(new Animated.Value(0)).current;
-  const prevPriceRef = useRef(initialPrice);
-  const [flashType, setFlashType] = useState<'up' | 'down'>('up');
-
-  const triggerFlash = (newPrice: string, oldPrice: string) => {
-    setPrice(newPrice);
-    
-    const newP = parseFloat(newPrice);
-    const oldP = parseFloat(oldPrice);
-    if (newP > oldP) setFlashType('up');
-    else if (newP < oldP) setFlashType('down');
-
-    flashAnim.setValue(1);
-    Animated.timing(flashAnim, {
-      toValue: 0,
-      duration: 500, // 0.5s flash
-      useNativeDriver: false, // Must be false for color interpolation
-    }).start();
-  };
-
-  useEffect(() => {
-    if (initialPrice !== prevPriceRef.current) {
-      triggerFlash(initialPrice, prevPriceRef.current);
-      prevPriceRef.current = initialPrice;
-    }
-  }, [initialPrice]);
-
-  const formatProbability = (pStr: string) => {
-    const p = parseFloat(pStr);
-    if (isNaN(p)) return '0%';
-    return (p * 100).toFixed(0) + '%';
-  };
-
-  const flashColor = flashAnim.interpolate({
-    inputRange: [0, 1],
-    outputRange: ['#FFFFFF', flashType === 'up' ? '#00FF00' : '#FFB000']
-  });
-
-  return (
-    <View style={styles.detailOutcomeRow}>
-      <Text style={styles.detailOutcomeText}>{outcome}</Text>
-      <Animated.Text style={[styles.detailPriceText, { color: flashColor }]}>
-        {formatProbability(initialPrice)}
-      </Animated.Text>
-    </View>
-  );
-};
-
 export default function App() {
   const [fontsLoaded, setFontsLoaded] = useState(false);
   const [markets, setMarkets] = useState<Market[]>([]);
@@ -71,15 +19,59 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<Category | null>(null);
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
-  
-  // Real-time prices mapped by outcome index for the selected market
-  const [livePrices, setLivePrices] = useState<string[]>([]);
+
+  // A separate component to handle real-time price updates and flash animations
+  const LiveOutcomeRow = ({ outcome, initialPrice }: { outcome: string, initialPrice: string }) => {
+    const prevPriceRef = useRef(initialPrice);
+    const [displayPrice, setDisplayPrice] = useState(initialPrice);
+    const flashAnim = useRef(new Animated.Value(0)).current;
+    const [flashType, setFlashType] = useState<'up' | 'down'>('up');
+
+    useEffect(() => {
+      if (initialPrice !== prevPriceRef.current) {
+        const newP = parseFloat(initialPrice);
+        const oldP = parseFloat(prevPriceRef.current);
+        if (newP > oldP) setFlashType('up');
+        else if (newP < oldP) setFlashType('down');
+        setDisplayPrice(initialPrice);
+        prevPriceRef.current = initialPrice;
+
+        flashAnim.setValue(1);
+        Animated.timing(flashAnim, { toValue: 0, duration: 600, useNativeDriver: false }).start();
+      }
+    }, [initialPrice]);
+
+    const formatProbability = (pStr: string) => {
+      const p = parseFloat(pStr);
+      if (isNaN(p)) return '0%';
+      return (p * 100).toFixed(0) + '%';
+    };
+
+    const flashColor = flashAnim.interpolate({
+      inputRange: [0, 1],
+      outputRange: ['#FFFFFF', flashType === 'up' ? '#00FF88' : '#FFB000']
+    });
+
+    return (
+      <View style={styles.detailOutcomeRow}>
+        <Text style={styles.detailOutcomeText} numberOfLines={2}>{outcome}</Text>
+        <Animated.Text style={[styles.detailPriceText, { color: flashColor }]}>
+          {formatProbability(displayPrice)}
+        </Animated.Text>
+      </View>
+    );
+  };
+
+  // Real-time prices: map from submarket id -> yes price string
+  const [livePriceMap, setLivePriceMap] = useState<Record<string, string>>({});
 
   const [fadeAnim] = useState(new Animated.Value(0));
   const [slideAnim] = useState(new Animated.Value(15));
   const [bgFade] = useState(new Animated.Value(0.8));
 
   const wsRef = useRef<WebSocket | null>(null);
+  const flatListRef = useRef<any>(null);
+  const selectedIndexRef = useRef<number>(-1); // track tapped item index for scroll restoration
 
   const fadeIn = () => {
     fadeAnim.setValue(0);
@@ -103,19 +95,20 @@ export default function App() {
         wsRef.current.close();
         wsRef.current = null;
       }
+      setLivePriceMap({});
       return;
     }
 
-    const mainMarket = selectedMarket.markets[0];
-    if (!mainMarket) return;
-
-    // Set initial static prices from DB Rest API
-    try {
-      setLivePrices(Array.isArray(mainMarket.outcomePrices) ? mainMarket.outcomePrices : JSON.parse(mainMarket.outcomePrices || '[]'));
-    } catch(e) { setLivePrices([]); }
+    // Seed initial prices from DB data
+    const initialMap: Record<string, string> = {};
+    selectedMarket.markets.forEach(sub => {
+      let prices: string[] = [];
+      try { prices = Array.isArray(sub.outcomePrices) ? sub.outcomePrices : JSON.parse(sub.outcomePrices || '[]'); } catch(e){}
+      if (prices[0]) initialMap[sub.id] = prices[0];
+    });
+    setLivePriceMap(initialMap);
 
     const marketIds = selectedMarket.markets.map(m => m.id);
-    
     let reconnectTimer: ReturnType<typeof setTimeout>;
     let isActive = true;
     let backoffDelay = 1000;
@@ -124,33 +117,28 @@ export default function App() {
       if (!isActive) return;
       if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) return;
 
-      const ws = new WebSocket('wss://gamma-api.polymarket.com/events');
+      // Correct Polymarket CLOB WebSocket endpoint
+      const ws = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
       wsRef.current = ws;
 
       ws.onopen = () => {
-        backoffDelay = 1000; // Reset backoff on success
-        ws.send(JSON.stringify({
-          assets_ids: marketIds,
-          type: "market"
-        }));
+        backoffDelay = 1000;
+        ws.send(JSON.stringify({ assets_ids: marketIds, type: 'market' }));
       };
 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
           if (Array.isArray(data)) {
-            let updated = false;
-            data.forEach((update: any) => {
-              if (update.price && marketIds.includes(update.asset_id)) {
-                updated = true;
+            const updates: Record<string, string> = {};
+            data.forEach((msg: any) => {
+              // Each message has asset_id (submarket ID) and price (Yes price)
+              if (msg.asset_id && msg.price && marketIds.includes(msg.asset_id)) {
+                updates[msg.asset_id] = msg.price;
               }
             });
-            if (updated || data.length > 0) {
-                setLivePrices(prev => {
-                  const next = [...prev];
-                  next[0] = (parseFloat(next[0] || "0") + 0.001).toString();
-                  return next;
-                });
+            if (Object.keys(updates).length > 0) {
+              setLivePriceMap(prev => ({ ...prev, ...updates }));
             }
           }
         } catch (e) {
@@ -161,9 +149,8 @@ export default function App() {
       ws.onerror = (e) => console.log('WS Error', e);
       ws.onclose = () => {
         if (isActive) {
-          console.log(`WS Closed. Reconnecting in ${backoffDelay}ms...`);
           reconnectTimer = setTimeout(connectWS, backoffDelay);
-          backoffDelay = Math.min(backoffDelay * 1.5, 15000); // Max cap 15s
+          backoffDelay = Math.min(backoffDelay * 1.5, 15000);
         }
       };
     };
@@ -171,17 +158,14 @@ export default function App() {
     connectWS();
 
     const appStateSubscription = AppState.addEventListener('change', (nextAppState: AppStateStatus) => {
-      if (nextAppState === 'active') {
-        connectWS();
-      } else if (nextAppState === 'background') {
-        if (wsRef.current) wsRef.current.close();
-      }
+      if (nextAppState === 'active') connectWS();
+      else if (nextAppState === 'background') wsRef.current?.close();
     });
 
     return () => {
       isActive = false;
       clearTimeout(reconnectTimer);
-      if (wsRef.current) wsRef.current.close();
+      wsRef.current?.close();
       appStateSubscription.remove();
     };
   }, [selectedMarket]);
@@ -225,6 +209,7 @@ export default function App() {
 
   const handleSelectCategory = (category: Category) => {
     setSelectedCategory(category);
+    selectedIndexRef.current = -1; // Reset scroll index when changing category
     loadMarkets(category);
   };
 
@@ -257,86 +242,108 @@ export default function App() {
             </>
           );
         }
-    
-        if (selectedMarket) {
-          const mainMarket = selectedMarket.markets[0];
-          // Fix array parsing since Axios natively parses JSON
-          let outcomes: string[] = [];
-          if (mainMarket) {
-            if (Array.isArray(mainMarket.outcomes)) outcomes = mainMarket.outcomes;
-            else { try { outcomes = JSON.parse(mainMarket.outcomes || '[]'); } catch(e){} }
-          }
-    
-          return (
-            <View style={{ flex: 1 }}>
+        return (
+          <View style={{ flex: 1 }}>
+            {/* --- LIST VIEW --- */}
+            <View style={{ flex: 1, display: selectedMarket ? 'none' : 'flex' }}>
               <View style={styles.navHeader}>
-                <TouchableOpacity onPress={handleBack} style={styles.backButton}>
-                  <Text style={styles.backText}>← Back to List</Text>
-                </TouchableOpacity>
+                <TouchableOpacity onPress={handleBack} style={styles.backButton}><Text style={styles.backText}>← Back to List</Text></TouchableOpacity>
               </View>
-    
-              <View style={styles.glassContainer}>
+              
+              <Text style={styles.sectionTitle}>
+                {selectedCategory === 'macro' ? '거시경제 / MACRO' : selectedCategory === 'stock' ? '주식 / STOCK' : '가상자산 / CRYPTO'}
+              </Text>
+
+              <FlatList
+                ref={flatListRef}
+                data={markets}
+                keyExtractor={(item) => item.id}
+                renderItem={({ item }) => (
+                    <TouchableOpacity activeOpacity={0.8} onPress={() => setSelectedMarket(item)}>
+                        <View style={styles.glassContainerCard}>
+                            <Text style={styles.cardCategoryLabel}>{item.category || 'GENERAL'}</Text>
+                            <Text style={styles.cardTitle}>{item.title}</Text>
+                            {item.originalTitle ? <Text style={styles.cardTitleEng}>{item.originalTitle}</Text> : null}
+                            <View style={styles.cardFooter}>
+                                <Text style={styles.cardVolume}>VOL: ${item.volume.toLocaleString()}</Text>
+                                <Text style={styles.cardArrow}>DETAILS →</Text>
+                            </View>
+                        </View>
+                    </TouchableOpacity>
+                )}
+                refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#FFFFFF" />}
+                ListEmptyComponent={
+                  <View style={styles.emptyContainer}>
+                    <Text style={styles.emptyText}>{loading ? 'LOADING WORLD TERMINAL...' : 'NO ACTIVE MARKETS DETECTED'}</Text>
+                  </View>
+                }
+                contentContainerStyle={styles.listContent}
+                showsVerticalScrollIndicator={false}
+              />
+            </View>
+
+            {/* --- DETAIL VIEW --- */}
+            {selectedMarket && (
+              <View style={{ flex: 1 }}>
+                <View style={styles.navHeader}>
+                  <TouchableOpacity onPress={handleBack} style={styles.backButton}>
+                    <Text style={styles.backText}>← Back to List</Text>
+                  </TouchableOpacity>
+                </View>
+
                 <View style={styles.detailTitleContainer}>
                   <Text style={styles.detailTitleKor}>
-                    {selectedMarket.title.split('\n')[0].split('(')[0].trimEnd()}
-                    {selectedMarket.title.split('\n')[0].includes('(') && (
+                    {selectedMarket!.title.split('\n')[0].split('(')[0].trimEnd()}
+                    {selectedMarket!.title.split('\n')[0].includes('(') && (
                       <Text style={styles.detailTitleParen}>
-                        {'\n(' + selectedMarket.title.split('\n')[0].split('(')[1]}
+                        {'\n(' + selectedMarket!.title.split('\n')[0].split('(')[1]}
                       </Text>
                     )}
                   </Text>
+                  {selectedMarket!.originalTitle ? (
+                    <Text style={styles.detailTitleEng}>
+                      {selectedMarket!.originalTitle}
+                    </Text>
+                  ) : null}
                   <Text style={styles.detailVolume}>
-                    VOLUME: ${selectedMarket.volume?.toLocaleString()}
+                    VOLUME: ${selectedMarket!.volume?.toLocaleString()}
                   </Text>
                 </View>
-    
-                <View style={styles.outcomesList}>
-                  {outcomes.map((outcome, index) => {
-                    const currentPrice = livePrices[index] || '0';
-                    return (
-                      <LiveOutcomeRow key={index} outcome={outcome} initialPrice={currentPrice} />
-                    );
-                  })}
+
+                <View style={styles.glassContainer}>
+                  <ScrollView 
+                    style={styles.outcomesListWrapper} 
+                    contentContainerStyle={styles.outcomesList}
+                    showsVerticalScrollIndicator={false}
+                  >
+                    {selectedMarket!.markets.map((subMarket, mIdx) => {
+                      let outcomes: string[] = [];
+                      if (Array.isArray(subMarket.outcomes)) outcomes = subMarket.outcomes;
+                      else { try { outcomes = JSON.parse(subMarket.outcomes || '[]'); } catch(e){} }
+
+                      let prices: string[] = [];
+                      if (Array.isArray(subMarket.outcomePrices)) prices = subMarket.outcomePrices;
+                      else { try { prices = JSON.parse(subMarket.outcomePrices || '[]'); } catch(e){} }
+
+                      const isBinary = outcomes.length === 2 && 
+                        ['yes', '예'].includes((outcomes[0] || '').toLowerCase());
+
+                      if (isBinary) {
+                        const label = subMarket.question || `Option ${mIdx + 1}`;
+                        const livePrice = livePriceMap[subMarket.id] || prices[0] || '0';
+                        return (
+                          <LiveOutcomeRow key={subMarket.id || mIdx} outcome={label} initialPrice={livePrice} />
+                        );
+                      } else {
+                        return outcomes.map((outcome, oIdx) => (
+                          <LiveOutcomeRow key={`${subMarket.id}-${oIdx}`} outcome={outcome} initialPrice={prices[oIdx] || '0'} />
+                        ));
+                      }
+                    })}
+                  </ScrollView>
                 </View>
               </View>
-            </View>
-          );
-        }
-    
-        return (
-          <View style={{ flex: 1 }}>
-            <View style={styles.navHeader}>
-              <TouchableOpacity onPress={handleBack} style={styles.backButton}><Text style={styles.backText}>← Back to List</Text></TouchableOpacity>
-            </View>
-            
-            <Text style={styles.sectionTitle}>
-              {selectedCategory === 'macro' ? '거시경제 / MACRO' : selectedCategory === 'stock' ? '주식 / STOCK' : '가상자산 / CRYPTO'}
-            </Text>
-
-            <FlatList
-              data={markets}
-              keyExtractor={(item) => item.id}
-              renderItem={({ item }) => (
-                  <TouchableOpacity activeOpacity={0.8} onPress={() => setSelectedMarket(item)}>
-                      <View style={styles.glassContainerCard}>
-                          <Text style={styles.cardCategoryLabel}>{item.category || 'GENERAL'}</Text>
-                          <Text style={styles.cardTitle}>{item.title}</Text>
-                          <View style={styles.cardFooter}>
-                              <Text style={styles.cardVolume}>VOL: ${item.volume.toLocaleString()}</Text>
-                              <Text style={styles.cardArrow}>DETAILS →</Text>
-                          </View>
-                      </View>
-                  </TouchableOpacity>
-              )}
-              refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#FFFFFF" />}
-              ListEmptyComponent={
-                <View style={styles.emptyContainer}>
-                  <Text style={styles.emptyText}>{loading ? 'LOADING WORLD TERMINAL...' : 'NO ACTIVE MARKETS DETECTED'}</Text>
-                </View>
-              }
-              contentContainerStyle={styles.listContent}
-              showsVerticalScrollIndicator={false}
-            />
+            )}
           </View>
         );
       };
@@ -368,21 +375,24 @@ export default function App() {
       listContent: { paddingBottom: 60, gap: 16 },
       glassContainerCard: { backgroundColor: 'rgba(255, 255, 255, 0.03)', padding: 24, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)' },
       cardCategoryLabel: { color: 'rgba(255, 255, 255, 0.4)', fontSize: 10, fontFamily: 'Pretendard-Bold', letterSpacing: 2, marginBottom: 12, textTransform: 'uppercase' },
-      cardTitle: { color: '#FFFFFF', fontSize: 18, fontFamily: 'Pretendard-Bold', lineHeight: 26, minHeight: 60 },
+      cardTitle: { color: '#FFFFFF', fontSize: 18, fontFamily: 'Pretendard-Bold', lineHeight: 26 },
+      cardTitleEng: { color: 'rgba(255, 255, 255, 0.4)', fontSize: 13, fontFamily: 'Pretendard-Medium', lineHeight: 18, marginTop: 6 },
       cardFooter: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 16 },
       cardVolume: { color: 'rgba(255, 255, 255, 0.3)', fontSize: 10, fontFamily: 'Pretendard-Medium', letterSpacing: 1 },
       cardArrow: { color: 'rgba(255, 255, 255, 0.3)', fontSize: 10, fontFamily: 'Pretendard-Bold', letterSpacing: 1 },
       emptyContainer: { padding: 60, alignItems: 'center', backgroundColor: 'rgba(255, 255, 255, 0.03)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)' }, 
       emptyText: { color: 'rgba(255, 255, 255, 0.3)', fontSize: 12, fontFamily: 'Pretendard-Medium', letterSpacing: 2 },
       detailContainer: { marginTop: 10 }, 
-      glassContainer: { backgroundColor: 'rgba(255, 255, 255, 0.03)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)', padding: 24 },
-      detailTitleContainer: { marginBottom: 30 },
-      detailTitleKor: { color: '#FFFFFF', fontSize: 24, fontFamily: 'Pretendard-Bold', lineHeight: 32, marginBottom: 12 },
+      glassContainer: { flex: 1, backgroundColor: 'rgba(255, 255, 255, 0.03)', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.1)', paddingHorizontal: 24, paddingTop: 10, paddingBottom: 0 },
+      detailTitleContainer: { marginTop: 16, marginBottom: 24, paddingHorizontal: 4 },
+      detailTitleKor: { color: '#FFFFFF', fontSize: 26, fontFamily: 'Pretendard-Bold', lineHeight: 34, marginBottom: 12 },
       detailTitleParen: { color: '#FFFFFF', fontSize: 20, fontFamily: 'Pretendard-Medium' },
-      detailVolume: { color: 'rgba(255, 255, 255, 0.4)', fontSize: 12, fontFamily: 'Pretendard-Medium', textTransform: 'uppercase', letterSpacing: 1 },
-      outcomesList: { gap: 0 },
-      detailOutcomeRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.05)' },
-      detailOutcomeText: { color: 'rgba(255, 255, 255, 0.6)', fontSize: 14, fontFamily: 'Pretendard-Medium' },
-      detailPriceText: { color: '#FFFFFF', fontSize: 16, fontFamily: 'Pretendard-Bold' }
+      detailTitleEng: { color: 'rgba(255, 255, 255, 0.4)', fontSize: 15, fontFamily: 'Pretendard-Medium', lineHeight: 22, marginTop: -4, marginBottom: 12 },
+      detailVolume: { color: 'rgba(255, 255, 255, 0.4)', fontSize: 13, fontFamily: 'Pretendard-Medium', textTransform: 'uppercase', letterSpacing: 1 },
+      outcomesListWrapper: { flex: 1 },
+      outcomesList: { paddingBottom: 30 },
+      detailOutcomeRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.05)' },
+      detailOutcomeText: { flex: 1, color: 'rgba(255, 255, 255, 0.6)', fontSize: 14, fontFamily: 'Pretendard-Medium', paddingRight: 16, lineHeight: 20 },
+      detailPriceText: { color: '#FFFFFF', fontSize: 16, fontFamily: 'Pretendard-Bold', minWidth: 48, textAlign: 'right' }
     });
 
