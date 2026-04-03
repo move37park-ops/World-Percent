@@ -9,18 +9,29 @@ export const translateBatchToKorean = async (texts: string[]): Promise<string[]>
     const uniqueTexts = Array.from(new Set(texts)).filter(t => t.trim() !== '');
     if (uniqueTexts.length === 0) return texts;
 
-    // 1. Check cache
-    const { data: cached, error: cacheErr } = await supabase
-        .from('translation_cache')
-        .select('source_text, translated_text')
-        .in('source_text', uniqueTexts);
-
-    if (cacheErr) console.error('Cache Read Error:', cacheErr);
-
+    // 1. Check cache safely in chunks to avoid URL length limits
     const cacheMap = new Map<string, string>();
-    (cached || []).forEach(row => cacheMap.set(row.source_text, row.translated_text));
+    const CACHE_CHUNK_SIZE = 100;
+    let cacheReadFailed = false;
 
-    const textsToTranslate = uniqueTexts.filter(t => {
+    for (let i = 0; i < uniqueTexts.length; i += CACHE_CHUNK_SIZE) {
+        const chunk = uniqueTexts.slice(i, i + CACHE_CHUNK_SIZE);
+        const { data: cached, error: cacheErr } = await supabase
+            .from('translation_cache')
+            .select('source_text, translated_text')
+            .in('source_text', chunk);
+
+        if (cacheErr) {
+            console.error('Cache Read Error:', cacheErr);
+            cacheReadFailed = true; 
+        } else {
+            (cached || []).forEach(row => cacheMap.set(row.source_text, row.translated_text));
+        }
+    }
+
+    // If cache read failed completely for some chunks, we might accidentally re-translate everything.
+    // To protect DeepL API limits, we will fallback to not translating missed ones in this run.
+    const textsToTranslate = cacheReadFailed ? [] : uniqueTexts.filter(t => {
         const lower = t.toLowerCase();
         return !cacheMap.has(t) && lower !== 'yes' && lower !== 'no';
     });
