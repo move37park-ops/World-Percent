@@ -3,6 +3,9 @@ import axios from 'axios';
 import { supabase } from '../../../utils/supabase';
 import { translateBatchToKorean } from '../../../services/translator';
 
+export const maxDuration = 60; // Vercel hobby max is 60s
+export const dynamic = 'force-dynamic'; // Prevent edge caching
+
 const POLYMARKET_API_URL = 'https://gamma-api.polymarket.com/events';
 const VOLUME_THRESHOLD = 100000;
 const TAG_WHITELIST = ['Macro', 'Interest Rates', 'Stocks', 'Equities', 'Geopolitics', 'Elections', 'Politics', 'Crypto', 'Bitcoin', 'Ethereum'];
@@ -15,18 +18,9 @@ export async function GET(request: Request) {
     }
 
     try {
-        // 0. CLEANUP: Remove expired markets from DB before fetching new data
-        const now = new Date().toISOString();
-        const { error: cleanupErr } = await supabase
-            .from('markets')
-            .delete()
-            .lt('end_date', now);
-        if (cleanupErr) console.warn('[Cron Worker] Cleanup warning:', cleanupErr.message);
-        else console.log('[Cron Worker] Expired markets cleaned up.');
-
         console.log('[Cron Worker] Starting Polymarket data fetch...');
         const response = await axios.get(POLYMARKET_API_URL, {
-            params: { limit: 100, active: true, closed: false, order: 'volume', ascending: false }
+            params: { limit: 500, active: true, closed: false, order: 'volume', ascending: false }
         });
 
         const events = response.data;
@@ -62,6 +56,18 @@ export async function GET(request: Request) {
 
         if (targetEvents.length === 0) {
             return NextResponse.json({ success: true, inserted: 0, updated: 0, message: 'No target events found' });
+        }
+
+        // 1.5. EXACT SYNC CLEANUP: Delete markets in DB that are no longer in targetEvents
+        const targetEventIds = new Set(targetEvents.map((e: any) => String(e.id)));
+        const { data: allDbMarkets } = await supabase.from('markets').select('polymarket_id');
+        const dbIds = (allDbMarkets || []).map((m: any) => m.polymarket_id);
+        
+        const idsToDelete = dbIds.filter(id => !targetEventIds.has(id));
+        if (idsToDelete.length > 0) {
+            const { error: cleanupErr } = await supabase.from('markets').delete().in('polymarket_id', idsToDelete);
+            if (cleanupErr) console.warn('[Cron Worker] Cleanup warning:', cleanupErr.message);
+            else console.log(`[Cron Worker] Deleted ${idsToDelete.length} stale/resolved markets.`);
         }
 
         // 2. BULK FETCH Existing Markets to solve N+1 Query Issue
@@ -127,7 +133,8 @@ export async function GET(request: Request) {
             const existing = existingMap.get(String(event.id));
 
             if (existing) {
-                // UPDATE path: only translate outcomes + questions
+                // UPDATE path: always include title to check/fix previous English leaks
+                if (event.title) allTextsToTranslate.add(event.title);
                 outcomesList.forEach((m: any) => {
                     if (m.question) allTextsToTranslate.add(m.question);
                     if (Array.isArray(m.outcomes)) {
@@ -178,8 +185,19 @@ export async function GET(request: Request) {
         let newCount = 0;
         let updateCount = 0;
 
-        for (const proc of processedEvents) {
-            const { type, event, outcomesList } = proc;
+        processedEvents.forEach(({ type, event, outcomesList }) => {
+            const title = event.title || '';
+            const translatedTitle = getTranslated(title);
+            
+            // CRITICAL BUG FIX: If translation failed (returned original English) for a significant title,
+            // we should NOT save this market yet. Skip it and let it retry in the next cron run.
+            // (Exclude very short strings or specific common English names like 'Bitcoin')
+            const isEnglish = (t: string) => /[a-zA-Z]/.test(t) && !/[ㄱ-ㅎㅏ-ㅣ가-힣]/.test(t);
+            if (title.length > 5 && translatedTitle === title && isEnglish(title) && !['bitcoin', 'ethereum', 'crypto', 'stocks'].includes(title.toLowerCase())) {
+                console.log(`[Cron Worker] Skipping ${title} - Translation failed (still English).`);
+                return;
+            }
+
             const translatedOutcomes = translateOutcomesList(outcomesList);
             
             if (type === 'update') {
@@ -189,12 +207,11 @@ export async function GET(request: Request) {
                     end_date: event.endDate || null,
                     outcomes: outcomesList,
                     translated_outcomes: translatedOutcomes,
+                    translated_title: translatedTitle, // Refresh title if it's in the cache now
                     updated_at: new Date().toISOString()
                 });
                 updateCount++;
             } else {
-                const translatedTitle = getTranslated(event.title);
-                
                 let category = 'macro';
                 if (event.tags && Array.isArray(event.tags)) {
                     for (const tag of event.tags) {
@@ -218,7 +235,7 @@ export async function GET(request: Request) {
                 });
                 newCount++;
             }
-        }
+        });
 
         // 3. BULK UPSERT / UPDATE
         if (upsertBatch.length > 0) {

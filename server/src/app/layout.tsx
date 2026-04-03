@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "World Terminal",
+  title: "World %",
   description: "Beyond Probability • Realtime Insights on global markets, politics, and crypto.",
 };
 

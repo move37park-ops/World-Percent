@@ -29,6 +29,14 @@ export const translateBatchToKorean = async (texts: string[]): Promise<string[]>
         }
     }
 
+    // Auto-recovery: detect "stuck" cache entries where translation failed (English → English)
+    const isEnglishOnly = (t: string) => /[a-zA-Z]/.test(t) && !/[ㄱ-ㅎㅏ-ㅣ가-힣]/.test(t);
+    for (const [src, trans] of cacheMap.entries()) {
+        if (src.length > 3 && src === trans && isEnglishOnly(src)) {
+            cacheMap.delete(src); // Remove bad cache entry so it gets retranslated
+        }
+    }
+
     // If cache read failed completely for some chunks, we might accidentally re-translate everything.
     // To protect DeepL API limits, we will fallback to not translating missed ones in this run.
     const textsToTranslate = cacheReadFailed ? [] : uniqueTexts.filter(t => {

@@ -1,11 +1,13 @@
 'use client';
 
+export const dynamic = 'force-dynamic';
+
 import React, { useEffect, useState, useRef } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL || '',
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ''
+    process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co',
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'dummy_key_to_prevent_crash'
 );
 
 interface SubMarket {
@@ -117,7 +119,7 @@ export default function Home() {
     if (!selectedCategory) {
         return (
             <main style={s.page}>
-                <h1 style={s.h1}>WORLD TERMINAL</h1>
+                <h1 style={s.h1}>WORLD %</h1>
                 <p style={s.sub}>BEYOND PROBABILITY • REALTIME INSIGHTS</p>
                 <div style={s.catGrid}>
                     {([['macro','거시경제 / MACRO'],['stock','주식 / STOCK'],['crypto','가상자산 / CRYPTO']] as [string,string][]).map(([cat, label]) => (

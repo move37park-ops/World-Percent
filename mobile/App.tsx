@@ -335,9 +335,13 @@ export default function App() {
                           <LiveOutcomeRow key={subMarket.id || mIdx} outcome={label} initialPrice={livePrice} />
                         );
                       } else {
-                        return outcomes.map((outcome, oIdx) => (
-                          <LiveOutcomeRow key={`${subMarket.id}-${oIdx}`} outcome={outcome} initialPrice={prices[oIdx] || '0'} />
-                        ));
+                        return (
+                          <React.Fragment key={subMarket.id || mIdx}>
+                            {outcomes.map((outcome, oIdx) => (
+                              <LiveOutcomeRow key={`${subMarket.id}-${oIdx}`} outcome={outcome} initialPrice={prices[oIdx] || '0'} />
+                            ))}
+                          </React.Fragment>
+                        );
                       }
                     })}
                   </ScrollView>
